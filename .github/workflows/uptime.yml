@@ -1,0 +1,104 @@
+# Uptime alerting for Tensile (Jiffy) production. Lives in the PUBLIC repo rsyed94/tensile-uptime (source of truth:
+# .github/workflows/uptime.yml (scheduled workflows on public repos cost nothing); the source is ops/uptime/ in
+# rsyed94/jiffy. See ops/uptime/README.md.
+#
+# Every 5 minutes: GET /healthz (liveness) and /readyz (DB, job queue lag, failed jobs). A probe that fails is
+# retried once after 120 s; two failures in a row open (or refresh) one GitHub issue that @-mentions the founder, so
+# GitHub emails them, and a passing probe closes it. No third-party actions: only curl, jq and gh from the runner.
+name: uptime
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+env:
+  BASE_URL: https://jiffy-app-production.up.railway.app
+  ALERT_USER: rsyed94
+  ALERT_LABEL: uptime-alert
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Probe, then open, refresh or close the alert issue
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          # Prints a reason and returns 1 when production is down or degraded. Only status codes and the fixed
+          # `degraded` labels are echoed (stripped to safe characters): never raw response text into a public issue.
+          probe() {
+            local code
+            code=$(curl -sS -o /dev/null -m 20 -w '%{http_code}' "$BASE_URL/healthz") || code=000
+            if [ "$code" != 200 ]; then echo "/healthz returned HTTP $code"; return 1; fi
+            code=$(curl -sS -o ready.json -m 20 -w '%{http_code}' "$BASE_URL/readyz") || code=000
+            if [ "$code" = 200 ] && [ "$(jq -r '.status // "missing"' ready.json 2>/dev/null)" = ok ]; then return 0; fi
+            echo "/readyz returned HTTP $code, status $(jq -r '[.status, (.degraded // [] | join("+"))] | join(" ")' ready.json 2>/dev/null | tr -cd 'a-zA-Z0-9 +_-' | head -c 80)"
+            return 1
+          }
+
+          # Two failed probes 120 s apart (rides out a Railway restart), not one blip.
+          reason=$(probe) && ok=1 || ok=0
+          if [ "$ok" = 0 ]; then
+            echo "first probe failed: $reason"
+            sleep 120
+            reason=$(probe) && ok=1 || ok=0
+          fi
+
+          gh label create "$ALERT_LABEL" --color B60205 --description "Production uptime alert" 2>/dev/null || true
+          issue=$(gh issue list --label "$ALERT_LABEL" --state open --json number --jq '.[0].number // empty') || exit 1
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          epoch=$(date -u +%s)
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+          if [ "$ok" = 1 ]; then
+            echo "healthy"
+            if [ -n "$issue" ]; then
+              gh issue close "$issue" --comment "Recovered at $now: /healthz and /readyz pass. $run_url" || exit 1
+            fi
+            exit 0
+          fi
+
+          echo "ALERT: $reason"
+          # `mention-epoch` marks the last mention, so the hourly throttle survives long outages (comment lists page).
+          last_mention=$epoch
+          if [ -n "$issue" ]; then
+            last_mention=$(gh issue view "$issue" --json body --jq .body | sed -n 's/.*mention-epoch:\([0-9]*\).*/\1/p' | head -1)
+            last_mention=${last_mention:-0}
+          fi
+          renotify=0
+          if [ -n "$issue" ] && [ "$last_mention" -lt "$(( epoch - 3300 ))" ]; then renotify=1; last_mention=$epoch; fi
+          {
+            echo "@$ALERT_USER Tensile production ($BASE_URL) failed two probes 120 s apart."
+            echo
+            echo "- Last check: $now"
+            echo "- Reason: \`$reason\`"
+            echo "- Run: $run_url"
+            echo
+            echo "Check Railway service \`jiffy-app\` (deploys, logs). This issue closes itself on recovery."
+            echo
+            echo "<!-- mention-epoch:$last_mention -->"
+          } > body.md
+
+          if [ -z "$issue" ]; then
+            # The one failing run per outage: its workflow-failure email backs up the issue mention.
+            gh issue create --label "$ALERT_LABEL" --title "Production is down or degraded" --body-file body.md
+            exit 1
+          fi
+          # While it stays down: refresh the body (no email) and re-mention at most hourly. Exit 0 so each
+          # failing run doesn't also send a workflow-failure email.
+          gh issue edit "$issue" --body-file body.md || exit 1
+          if [ "$renotify" = 1 ]; then
+            gh issue comment "$issue" --body "@$ALERT_USER still failing at $now: \`$reason\` $run_url" || exit 1
+          fi
